@@ -1,0 +1,86 @@
+x-app-env: &app-env
+  environment:
+    APP_NAME: ${APP_NAME:-async-task-service}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/tasks}
+    RABBITMQ_URL: ${RABBITMQ_URL:-amqp://${RABBITMQ_DEFAULT_USER:-app}:${RABBITMQ_DEFAULT_PASS:-app}@rabbitmq:5672/}
+    TASK_QUEUE_NAME: ${TASK_QUEUE_NAME:-tasks}
+    WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+
+x-app-build: &app-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: async-task-service:latest
+
+services:
+  postgres:
+    image: postgres:14
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-tasks}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-tasks}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-app}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-app}
+    ports:
+      - "15672:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  migrate:
+    <<: [*app-build, *app-env]
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: [*app-build, *app-env]
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    <<: [*app-build, *app-env]
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  rabbitmqdata:
